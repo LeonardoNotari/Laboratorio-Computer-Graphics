@@ -1,2 +1,2 @@
-# Laboratorio-Computer-Graphics
-Elaborato per il Laboratorio di -computer Graphics Notari Leonardo.
+# Laboratorio-Computer-Graphics-Notari
+Elaborato per il Laboratorio di Computer Graphics Notari Leonardo.
