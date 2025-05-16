@@ -1,0 +1,180 @@
+#version 460 core
+#define PI 3.141592
+
+
+layout(local_size_x = 16, local_size_y = 16) in; //dimensioni del work group
+
+layout(rgba32f, binding = 0) uniform image2D img_output; //accesso alla texture
+
+layout(std430, binding = 1) buffer Scene {
+    vec4 spheres[]; // Ogni sfera occupa 2 vec4 (8 float) 
+};
+
+uniform vec3 cameraPos;
+uniform mat4 invViewProj;
+uniform int samples;
+uniform int sphereCount;
+
+// seed per numeri casuali
+uint seed = uint(gl_GlobalInvocationID.x) * 9277u + uint(gl_GlobalInvocationID.y) * 26699u;
+
+float rand() {
+    seed = (seed * 73129u + 95121u);
+    return float(seed % 100000u) / 100000.0;
+}    
+
+// Intersezione con la sfera
+bool hitSphere(vec3 center, float radius, vec3 rayOrigin, vec3 rayDir, out float t) {
+    vec3 oc = rayOrigin - center;
+    float a = dot(rayDir, rayDir); 
+    float b = 2.0 * dot(oc, rayDir);
+    float c = dot(oc, oc) - radius * radius;
+    float discriminant = b * b - 4.0 * a * c;
+    
+    if (discriminant < 0.0) {
+        return false;
+    }
+    float sqrtd = sqrt(discriminant);
+    float t0 = (-b - sqrtd)/(2.0*a);
+    float t1 = (-b + sqrtd)/(2.0*a);
+    if (t0 > 0.0001){
+        t = t0;
+    }else{
+        t = t1;
+    }
+    if(t<0.0001){
+        return false;
+    }
+    return true;
+}
+
+bool trace(vec3 rayOrigin, vec3 rayDir, out vec3 hitPoint, out vec3 normal, out vec3 albedo, out int materialType, out vec3 emission) {
+    float closestT = 1e10;
+    bool hitAnything = false;
+    emission = vec3(0.0);
+    
+    // Controllo intersezione con le sfere
+    for (int i = 0; i < sphereCount; i++) {
+        int base = i * 2;
+        vec3 center = spheres[base].xyz;
+        float radius = spheres[base].w;
+        
+        float t;
+        if (hitSphere(center, radius, rayOrigin, rayDir, t) && t < closestT) {
+            closestT = t;
+            hitPoint = rayOrigin + t * rayDir;
+            normal = normalize(hitPoint - center);
+            
+            albedo = spheres[base + 1].xyz;
+            materialType = int(spheres[base + 1].w);
+            
+            if (materialType == 3) {
+                emission = albedo * 15.0; // Intensità emissione
+            }
+            hitAnything = true;
+        }
+    }
+    return hitAnything;
+}
+
+vec3 calculateColor(vec3 rayOrigin, vec3 rayDir) {
+    vec3 color = vec3(0.0);
+    vec3 attenuation = vec3(1.0);
+    for (int bounce = 0; bounce < 6; bounce++) {
+        vec3 hitPoint, normal, albedo, emission;
+        int materialType;
+        if (trace(rayOrigin, rayDir, hitPoint, normal, albedo, materialType, emission)) {
+            // Aggiunge l'emissione al colore
+            color += attenuation * emission;
+        
+            if (materialType == 3) { //materiale emissivo 
+                break;
+            }
+            if (materialType == 0) { // materiale diffuso
+                // Calcolo della base ortogonale
+                vec3 W = dot(normal, rayDir) < 0.0 ? normal : -normal;
+                vec3 tangent_ref = abs(W.x) > 0.1 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0); // vettore non parallelo a W come riferimento
+                vec3 U = normalize(cross(tangent_ref, W)); // vettore tangente
+                vec3 V = cross(W, U); // binormale
+                
+                // Campionamento coseno pesate sull'emisfero
+                float r1 = 2.0 * PI * rand(); // angolo casuale
+                float r2 = rand(); 
+                float r2s = sqrt(r2); 
+                
+                // Coordinate del campione nell'emisfero locale
+                vec3 local_sample = vec3(
+                    cos(r1) * r2s,
+                    sin(r1) * r2s,
+                    sqrt(1.0 - r2)
+                );
+                rayDir = normalize(U * local_sample.x + V * local_sample.y + W * local_sample.z); // Trasforma il campione nello spazio mondo
+                rayOrigin = hitPoint + normal * 0.001;
+                attenuation *= albedo;  
+            }
+            else if(materialType == 1) {   // materiale speculare
+                rayDir = rayDir-2.0f*dot(normal, rayDir)*normal;
+                rayOrigin = hitPoint;
+                attenuation *= albedo;
+            } 
+            else if(materialType == 2) {  // materiale rifrattivo 
+                float ior = 1.5; //indice di rifrazione
+                float eta = dot(rayDir, normal) < 0.0 ? (1.0 / ior) : ior; //se il prodotto scalare tra direzione del raggio e normale è <0 allora è entrante
+                vec3 refractNormal = dot(rayDir, normal) < 0.0 ? normal : -normal; //se uscente si prende la normale invertita
+                float cos_theta = dot(rayDir, refractNormal);  //coseno dell'angolo
+                float cos_2phi = 1.0 - eta*eta*(1.00 - cos_theta * cos_theta); 
+
+                if (cos_2phi < 0.00) { //non c'è rifrazione
+                    rayDir = rayDir-2.0f*dot(normal, rayDir)*normal;
+                    rayOrigin = hitPoint + refractNormal * 0.001;
+                }else{
+                    rayDir = normalize(eta*rayDir -refractNormal*(eta*cos_theta + sqrt(cos_2phi)));
+                    float tmp =  dot(rayDir, normal) < 0.0 ? (-cos_theta) : dot(rayDir, normal);
+                    float c = 1.0 - tmp;
+                    
+                    float F0 = pow((1.0 - ior) / (1.0 + ior), 2.0); // Riflettività a incidenza normale
+                    float fresnel = F0 + (1.0 - F0) * pow(c, 5.0); // Approssimazione di Schlick
+                    float p_Re = 0.25 + 0.5 * fresnel;
+                    // Scegli tra riflessione e rifrazione in base a Fresnel (random per antialiasing)
+                    if (rand() < p_Re) {
+                        rayDir = rayDir-2.0f*dot(normal, rayDir)*normal; // luce riflessa
+                        rayOrigin = hitPoint + refractNormal * 0.001;
+                    } else {
+                        rayOrigin = hitPoint - refractNormal * 0.001;
+                    }
+                }
+            }
+        }
+    }
+    return color;
+}
+
+void main() {
+    ivec2 pixelCoords = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 imageSize = imageSize(img_output);
+
+    if (pixelCoords.x >= imageSize.x || pixelCoords.y >= imageSize.y) {
+        return;
+    }
+
+    vec3 totalColor = vec3(0.0);
+
+    for (int i = 0; i < samples; i++) {
+        seed += uint(i) * 7919u;
+
+        vec2 uv = (vec2(pixelCoords) + vec2(rand(), rand())) / vec2(imageSize); // posizione del pixel con valori normalizzati (tra 0 e 1)
+        vec2 ndc = uv * 2.0 - 1.0; // si converte in ndc per generare il raggio che passa per il punto (tra -1 e 1)
+        vec4 rayClip = vec4(ndc, -1.0, 1.0); //punto nello spazio clip
+        vec4 rayEye = invViewProj * rayClip; //punto nello spazio 3d con matrice di proiezione inversa
+        rayEye /= rayEye.w; 
+        vec3 rayDir = normalize(vec3(rayEye) - cameraPos); 
+
+        vec3 color = calculateColor(cameraPos, rayDir);
+        totalColor += color;
+    }
+    
+    vec3 finalColor = totalColor / float(samples);
+    imageStore(img_output, pixelCoords, vec4(finalColor, 1.0)); //scrive il colore nella texture nelle coordiate del pixel
+}
+
+
